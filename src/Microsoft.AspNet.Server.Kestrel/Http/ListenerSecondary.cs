@@ -32,15 +32,13 @@ namespace Microsoft.AspNet.Server.Kestrel.Http
         public Task StartAsync(
             string pipeName,
             ServerAddress address,
-            KestrelThread thread,
-            RequestDelegate application)
+            KestrelThread thread)
         {
             _pipeName = pipeName;
             _buf = thread.Loop.Libuv.buf_init(_ptr, 4);
 
             ServerAddress = address;
             Thread = thread;
-            Application = application;
 
             DispatchPipe = new UvPipeHandle(Log);
 
@@ -165,9 +163,8 @@ namespace Microsoft.AspNet.Server.Kestrel.Http
             // the exception that stopped the event loop will never be surfaced.
             if (Thread.FatalError == null)
             {
-                Thread.Send(state =>
+                Thread.Send(listener =>
                 {
-                    var listener = (ListenerSecondary)state;
                     listener.DispatchPipe.Dispose();
                     listener.FreeBuffer();
                 }, this);

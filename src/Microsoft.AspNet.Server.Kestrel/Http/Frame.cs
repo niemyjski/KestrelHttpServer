@@ -11,7 +11,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNet.Http;
 using Microsoft.AspNet.Http.Features;
-using Microsoft.AspNet.Server.Kestrel.Filter;
 using Microsoft.AspNet.Server.Kestrel.Infrastructure;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Primitives;
@@ -20,7 +19,7 @@ using Microsoft.Extensions.Primitives;
 
 namespace Microsoft.AspNet.Server.Kestrel.Http
 {
-    public partial class Frame : FrameContext, IFrameControl
+    public abstract partial class Frame : FrameContext, IFrameControl
     {
         private static readonly Encoding _ascii = Encoding.ASCII;
         private static readonly ArraySegment<byte> _endChunkBytes = CreateAsciiByteArraySegment("\r\n");
@@ -42,7 +41,7 @@ namespace Microsoft.AspNet.Server.Kestrel.Http
 
         private readonly object _onStartingSync = new Object();
         private readonly object _onCompletedSync = new Object();
-        private readonly FrameRequestHeaders _requestHeaders = new FrameRequestHeaders();
+        protected readonly FrameRequestHeaders _requestHeaders = new FrameRequestHeaders();
         private readonly FrameResponseHeaders _responseHeaders = new FrameResponseHeaders();
 
         private List<KeyValuePair<Func<object, Task>, object>> _onStarting;
@@ -51,24 +50,26 @@ namespace Microsoft.AspNet.Server.Kestrel.Http
 
         private bool _requestProcessingStarted;
         private Task _requestProcessingTask;
-        private volatile bool _requestProcessingStopping; // volatile, see: https://msdn.microsoft.com/en-us/library/x13ttww7.aspx
-        private volatile bool _requestAborted;
-        private CancellationTokenSource _disconnectCts = new CancellationTokenSource();
-        private CancellationTokenSource _requestAbortCts;
+        protected volatile bool _requestProcessingStopping; // volatile, see: https://msdn.microsoft.com/en-us/library/x13ttww7.aspx
+        protected volatile bool _requestAborted;
+        protected CancellationTokenSource _abortedCts;
+        protected CancellationToken? _manuallySetRequestAbortToken;
 
-        private FrameRequestStream _requestBody;
-        private FrameResponseStream _responseBody;
+        internal FrameRequestStream _requestBody;
+        internal FrameResponseStream _responseBody;
 
-        private bool _responseStarted;
-        private bool _keepAlive;
+        protected bool _responseStarted;
+        protected bool _keepAlive;
         private bool _autoChunk;
-        private Exception _applicationException;
+        protected Exception _applicationException;
 
         private HttpVersionType _httpVersion;
 
         private readonly IPEndPoint _localEndPoint;
         private readonly IPEndPoint _remoteEndPoint;
         private readonly Action<IFeatureCollection> _prepareRequest;
+
+        private readonly string _pathBase;
 
         public Frame(ConnectionContext context)
             : this(context, remoteEndPoint: null, localEndPoint: null, prepareRequest: null)
@@ -84,6 +85,7 @@ namespace Microsoft.AspNet.Server.Kestrel.Http
             _remoteEndPoint = remoteEndPoint;
             _localEndPoint = localEndPoint;
             _prepareRequest = prepareRequest;
+            _pathBase = context.ServerAddress.PathBase;
 
             FrameControl = this;
             Reset();
@@ -92,6 +94,7 @@ namespace Microsoft.AspNet.Server.Kestrel.Http
         public string Scheme { get; set; }
         public string Method { get; set; }
         public string RequestUri { get; set; }
+        public string PathBase { get; set; }
         public string Path { get; set; }
         public string QueryString { get; set; }
         public string HttpVersion
@@ -135,8 +138,47 @@ namespace Microsoft.AspNet.Server.Kestrel.Http
 
         public Stream DuplexStream { get; set; }
 
-        public CancellationToken RequestAborted { get; set; }
+        public CancellationToken RequestAborted
+        {
+            get
+            {
+                // If a request abort token was previously explicitly set, return it.
+                if (_manuallySetRequestAbortToken.HasValue)
+                    return _manuallySetRequestAbortToken.Value;
 
+                // Otherwise, get the abort CTS.  If we have one, which would mean that someone previously
+                // asked for the RequestAborted token, simply return its token.  If we don't,
+                // check to see whether we've already aborted, in which case just return an
+                // already canceled token.  Finally, force a source into existence if we still
+                // don't have one, and return its token.
+                var cts = _abortedCts;
+                return
+                    cts != null ? cts.Token :
+                    _requestAborted ? new CancellationToken(true) :
+                    RequestAbortedSource.Token;
+            }
+            set
+            {
+                // Set an abort token, overriding one we create internally.  This setter and associated
+                // field exist purely to support IHttpRequestLifetimeFeature.set_RequestAborted.
+                _manuallySetRequestAbortToken = value;
+            }
+        }
+
+        private CancellationTokenSource RequestAbortedSource
+        {
+            get
+            {
+                // Get the abort token, lazily-initializing it if necessary.
+                // Make sure it's canceled if an abort request already came in.
+                var cts = LazyInitializer.EnsureInitialized(ref _abortedCts, () => new CancellationTokenSource());
+                if (_requestAborted)
+                {
+                    cts.Cancel();
+                }
+                return cts;
+            }
+        }
         public bool HasResponseStarted
         {
             get { return _responseStarted; }
@@ -159,6 +201,7 @@ namespace Microsoft.AspNet.Server.Kestrel.Http
             Scheme = null;
             Method = null;
             RequestUri = null;
+            PathBase = null;
             Path = null;
             QueryString = null;
             _httpVersion = HttpVersionType.Unknown;
@@ -188,7 +231,8 @@ namespace Microsoft.AspNet.Server.Kestrel.Http
 
             _prepareRequest?.Invoke(this);
 
-            _requestAbortCts?.Dispose();
+            _manuallySetRequestAbortToken = null;
+            _abortedCts = null;
         }
 
         public void ResetResponseHeaders()
@@ -244,12 +288,15 @@ namespace Microsoft.AspNet.Server.Kestrel.Http
             {
                 ConnectionControl.End(ProduceEndType.SocketDisconnect);
                 SocketInput.AbortAwaiting();
-
-                _disconnectCts.Cancel();
+                RequestAbortedSource.Cancel();
             }
             catch (Exception ex)
             {
                 Log.LogError("Abort", ex);
+            }
+            finally
+            {
+                _abortedCts = null;
             }
         }
 
@@ -259,119 +306,7 @@ namespace Microsoft.AspNet.Server.Kestrel.Http
         /// The resulting Task from this loop is preserved in a field which is used when the server needs
         /// to drain and close all currently active connections.
         /// </summary>
-        public async Task RequestProcessingAsync()
-        {
-            try
-            {
-                var terminated = false;
-                while (!terminated && !_requestProcessingStopping)
-                {
-                    while (!terminated && !_requestProcessingStopping && !TakeStartLine(SocketInput))
-                    {
-                        terminated = SocketInput.RemoteIntakeFin;
-                        if (!terminated)
-                        {
-                            await SocketInput;
-                        }
-                    }
-
-                    while (!terminated && !_requestProcessingStopping && !TakeMessageHeaders(SocketInput, _requestHeaders))
-                    {
-                        terminated = SocketInput.RemoteIntakeFin;
-                        if (!terminated)
-                        {
-                            await SocketInput;
-                        }
-                    }
-
-                    if (!terminated && !_requestProcessingStopping)
-                    {
-                        var messageBody = MessageBody.For(HttpVersion, _requestHeaders, this);
-                        _keepAlive = messageBody.RequestKeepAlive;
-                        _requestBody = new FrameRequestStream(messageBody);
-                        RequestBody = _requestBody;
-                        _responseBody = new FrameResponseStream(this);
-                        ResponseBody = _responseBody;
-                        DuplexStream = new FrameDuplexStream(RequestBody, ResponseBody);
-
-                        _requestAbortCts = CancellationTokenSource.CreateLinkedTokenSource(_disconnectCts.Token);
-                        RequestAborted = _requestAbortCts.Token;
-
-                        var httpContext = HttpContextFactory.Create(this);
-                        try
-                        {
-                            await Application.Invoke(httpContext).ConfigureAwait(false);
-                        }
-                        catch (Exception ex)
-                        {
-                            ReportApplicationError(ex);
-                        }
-                        finally
-                        {
-                            // Trigger OnStarting if it hasn't been called yet and the app hasn't
-                            // already failed. If an OnStarting callback throws we can go through
-                            // our normal error handling in ProduceEnd.
-                            // https://github.com/aspnet/KestrelHttpServer/issues/43
-                            if (!_responseStarted && _applicationException == null)
-                            {
-                                await FireOnStarting();
-                            }
-
-                            await FireOnCompleted();
-
-                            HttpContextFactory.Dispose(httpContext);
-
-                            // If _requestAbort is set, the connection has already been closed.
-                            if (!_requestAborted)
-                            {
-                                await ProduceEnd();
-
-                                if (_keepAlive)
-                                {
-                                    // Finish reading the request body in case the app did not.
-                                    await messageBody.Consume();
-                                }
-                            }
-
-                            _requestBody.StopAcceptingReads();
-                            _responseBody.StopAcceptingWrites();
-                        }
-
-                        terminated = !_keepAlive;
-                    }
-
-                    Reset();
-                }
-            }
-            catch (Exception ex)
-            {
-                Log.LogWarning("Connection processing ended abnormally", ex);
-            }
-            finally
-            {
-                try
-                {
-                    _disconnectCts.Dispose();
-
-                    // If _requestAborted is set, the connection has already been closed.
-                    if (!_requestAborted)
-                    {
-                        // Inform client no more data will ever arrive
-                        ConnectionControl.End(ProduceEndType.SocketShutdownSend);
-
-                        // Wait for client to either disconnect or send unexpected data
-                        await SocketInput;
-
-                        // Dispose socket
-                        ConnectionControl.End(ProduceEndType.SocketDisconnect);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Log.LogWarning("Connection shutdown abnormally", ex);
-                }
-            }
-        }
+        public abstract Task RequestProcessingAsync();
 
         public void OnStarting(Func<object, Task> callback, object state)
         {
@@ -397,7 +332,7 @@ namespace Microsoft.AspNet.Server.Kestrel.Http
             }
         }
 
-        private async Task FireOnStarting()
+        protected async Task FireOnStarting()
         {
             List<KeyValuePair<Func<object, Task>, object>> onStarting = null;
             lock (_onStartingSync)
@@ -421,7 +356,7 @@ namespace Microsoft.AspNet.Server.Kestrel.Http
             }
         }
 
-        private async Task FireOnCompleted()
+        protected async Task FireOnCompleted()
         {
             List<KeyValuePair<Func<object, Task>, object>> onCompleted = null;
             lock (_onCompletedSync)
@@ -586,7 +521,7 @@ namespace Microsoft.AspNet.Server.Kestrel.Http
             return CreateResponseHeader(statusBytes, appCompleted, immediate);
         }
 
-        private async Task ProduceEnd()
+        protected async Task ProduceEnd()
         {
             if (_applicationException != null)
             {
@@ -693,7 +628,7 @@ namespace Microsoft.AspNet.Server.Kestrel.Http
             }
         }
 
-        private bool TakeStartLine(SocketInput input)
+        protected bool TakeStartLine(SocketInput input)
         {
             var scan = input.ConsumingStart();
             var consumed = scan;
@@ -766,13 +701,49 @@ namespace Microsoft.AspNet.Server.Kestrel.Http
                 RequestUri = requestUrlPath;
                 QueryString = queryString;
                 HttpVersion = httpVersion;
-                Path = RequestUri;
+
+                bool caseMatches;
+
+                if (!string.IsNullOrEmpty(_pathBase) &&
+                    (requestUrlPath.Length == _pathBase.Length || (requestUrlPath.Length > _pathBase.Length && requestUrlPath[_pathBase.Length] == '/')) &&
+                    RequestUrlStartsWithPathBase(requestUrlPath, out caseMatches))
+                {
+                    PathBase = caseMatches ? _pathBase : requestUrlPath.Substring(0, _pathBase.Length);
+                    Path = requestUrlPath.Substring(_pathBase.Length);
+                }
+                else
+                {
+                    Path = requestUrlPath;
+                }
+
                 return true;
             }
             finally
             {
                 input.ConsumingComplete(consumed, scan);
             }
+        }
+
+        private bool RequestUrlStartsWithPathBase(string requestUrl, out bool caseMatches)
+        {
+            caseMatches = true;
+
+            for (var i = 0; i < _pathBase.Length; i++)
+            {
+                if (requestUrl[i] != _pathBase[i])
+                {
+                    if (char.ToLowerInvariant(requestUrl[i]) == char.ToLowerInvariant(_pathBase[i]))
+                    {
+                        caseMatches = false;
+                    }
+                    else
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            return true;
         }
 
         public static bool TakeMessageHeaders(SocketInput input, FrameRequestHeaders requestHeaders)
@@ -894,9 +865,16 @@ namespace Microsoft.AspNet.Server.Kestrel.Http
                    statusCode != 304;
         }
 
-        private void ReportApplicationError(Exception ex)
+        protected void ReportApplicationError(Exception ex)
         {
-            _applicationException = ex;
+            if (_applicationException == null)
+            {
+                _applicationException = ex;
+            }
+            else
+            {
+                _applicationException = new AggregateException(_applicationException, ex);
+            }
             Log.ApplicationError(ex);
         }
 
